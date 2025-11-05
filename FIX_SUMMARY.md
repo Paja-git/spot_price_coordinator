@@ -1,10 +1,9 @@
 # FIX: Cheapest Blocks Not Updating When Tomorrow Data Available
 
 ## Problém
-Když se stala dostupná data pro zítřek (po 13:10 CET), senzory pro "cheapest blocks" **neaktualizovaly** svoje hodnoty správně při použití `cheapest_blocks_cross_midnight` a ani bez nej.
+Když se stala dostupná data pro zítřek (po 13:10 CET) a bylo zapnuto `cheapest_blocks_cross_midnight`, senzory pro "cheapest blocks" **neaktualizovaly** svoje hodnoty správně.
 
-## Příčina
-Původní kód v `IntervalSpotRateData.__init__()` (řádky 207-211):
+## Původní (špatný) kód
 
 ```python
 for block in config.all_cheapest_blocks():
@@ -14,196 +13,213 @@ for block in config.all_cheapest_blocks():
         intervals_for_cheapest = self._today_day.interval_by_dt
 ```
 
-**Problém**: `self._today_tomorrow_by_dt` obsahuje **VŠECHNY** intervaly včetně **MINULÝCH**. Když v 14:00 přijdou zítřejší data, algoritmus najde nejlevnější blok např. 02:00-05:00 (což už proběhlo), místo aby hledal jen v budoucích intervalech.
+**Problém**: `self._today_tomorrow_by_dt` obsahuje **VŠECHNY** intervaly (dnes + zítra) včetně **MINULÝCH**. Když v 14:00 přijdou zítřejší data, algoritmus může najít minulý blok (např. 02:00-05:00) místo budoucího.
+
+## Klíčový princip: Stabilita během dne
+
+### ⚠️ DŮLEŽITÉ: Proč NECHCEME filtrovat minulé intervaly před příchodem zítřejších dat
+
+**ŠPATNÝ přístup** (filtrovat vždy):
+```
+08:00 bez zítřka → hledá v 08:00-23:59 → najde blok 15:00-18:00
+10:00 bez zítřka → hledá v 10:00-23:59 → najde blok 15:00-18:00 (OK)
+14:00 bez zítřka → hledá v 14:00-23:59 → najde blok 20:00-23:00 (ZMĚNILO SE!)
+16:00 bez zítřka → hledá v 16:00-23:59 → najde blok 21:00-00:00 (ZMĚNILO SE!)
+```
+→ Hodnota senzoru se **mění každou hodinu** = nepoužitelné! ❌
+
+**SPRÁVNÝ přístup** (stabilní hodnota):
+```
+08:00 bez zítřka → hledá v 00:00-23:59 → najde blok 02:00-05:00
+10:00 bez zítřka → hledá v 00:00-23:59 → najde blok 02:00-05:00 (STEJNÉ!)
+14:00 bez zítřka → hledá v 00:00-23:59 → najde blok 02:00-05:00 (STEJNÉ!)
+16:00 bez zítřka → hledá v 00:00-23:59 → najde blok 02:00-05:00 (STEJNÉ!)
+```
+→ Hodnota senzoru je **stabilní celý den** = použitelné v automatizacích! ✓
+
+### Proč to dává smysl?
+
+1. **Senzor ukazuje "nejlevnější blok pro dnešek"**, ne "nejlevnější budoucí blok"
+2. **Uživatel kontroluje v automatizaci**, jestli je blok v budoucnosti:
+   ```yaml
+   - condition: template
+     value_template: >
+       {{ (state_attr('sensor.cheapest_3_hours', 'start') | as_datetime) > now() }}
+   ```
+3. **Stabilní hodnota = předvídatelné chování**
 
 ## Scénáře
 
-### Scénář 1: 08:00, NEMÁME zítřejší data ❌→✅
+### ✅ Scénář 1: Celý den BEZ zítřejších dat
 
-**PŘED opravou:**
 ```
-Čas: 08:00
-Tomorrow data: NEDOSTUPNÁ ✗
+cross_midnight: True
+tomorrow_data: NEDOSTUPNÁ ✗
 
-Hledání v intervalech:
-  00:00 → 1.50 CZK/kWh  (minulost)
-  01:00 → 1.20 CZK/kWh  (minulost)
-  02:00 → 1.10 CZK/kWh  (minulost) ← Nejlevnější!
-  ...
-  08:00 → 3.50 CZK/kWh  (teď)
-  09:00 → 3.80 CZK/kWh
-  ...
+00:00 → hledá v 00:00-23:59 (celý dnešek) → najde 02:00-05:00
+08:00 → hledá v 00:00-23:59 (celý dnešek) → najde 02:00-05:00 ← STEJNÉ
+14:00 → hledá v 00:00-23:59 (celý dnešek) → najde 02:00-05:00 ← STEJNÉ
+20:00 → hledá v 00:00-23:59 (celý dnešek) → najde 02:00-05:00 ← STEJNÉ
 
-Výsledek: 3h blok 02:00-05:00 ✓ (OK, protože nemáme lepší data)
+✓ Stabilní hodnota celý den
+✓ Uživatel ví: "nejlevnější blok pro dnešek byl 02:00-05:00"
+✓ Automatizace může zkontrolovat, jestli už proběhl
 ```
 
-**PO opravě:**
+### ✅ Scénář 2: V 14:00 PŘIJDOU zítřejší data (HLAVNÍ FIX!)
+
 ```
-Čas: 08:00
-Tomorrow data: NEDOSTUPNÁ ✗
+cross_midnight: True
+tomorrow_data: v 14:00 se změní na DOSTUPNÁ ✓
 
-Hledání v intervalech (VŠECHNY dnešní):
-  00:00 → 1.50 CZK/kWh  (minulost)
-  01:00 → 1.20 CZK/kWh  (minulost)
-  02:00 → 1.10 CZK/kWh  (minulost) ← Nejlevnější!
-  ...
-  08:00 → 3.50 CZK/kWh  (teď)
-  ...
+Před 14:00:
+  hledá v 00:00-23:59 (celý dnešek) → najde 02:00-05:00
 
-Výsledek: 3h blok 02:00-05:00 ✓ (stejné, nemáme zítřejší data)
-```
+Po 14:00 (přijdou zítřejší data):
+  hledá v 14:00-23:59 (zbývající dnes) + 00:00-23:59 (celý zítřek)
+  → najde 01:00-04:00 (zítra) ← AKTUALIZACE!
 
-### Scénář 2: 14:00, MÁME zítřejší data ❌→✅
-
-**PŘED opravou:**
-```
-Čas: 14:00
-Tomorrow data: DOSTUPNÁ ✓
-
-Hledání v intervalech (včetně minulosti):
-  00:00 → 1.50 CZK/kWh  (minulost)
-  01:00 → 1.20 CZK/kWh  (minulost) ← Nejlevnější v datasetu!
-  02:00 → 1.30 CZK/kWh  (minulost)
-  ...
-  14:00 → 4.50 CZK/kWh  (teď)
-  ...
-  Zítra 00:00 → 2.10 CZK/kWh
-  Zítra 01:00 → 1.80 CZK/kWh
-  Zítra 02:00 → 2.30 CZK/kWh
-
-Výsledek: 3h blok 01:00-04:00 (DNES RÁNO) ❌
-→ Nepoužitelné! Už je po 14:00!
+✓ Hodnota se aktualizuje JEDNOU, když přijdou zítřejší data
+✓ Nová hodnota ukazuje nejlevnější budoucí blok
+✓ Může být buď dnes večer, nebo zítra (podle cen)
 ```
 
-**PO opravě:**
+### ✅ Scénář 3: cross_midnight = False
+
 ```
-Čas: 14:00
-Tomorrow data: DOSTUPNÁ ✓
+cross_midnight: False
 
-Hledání v intervalech (JEN BUDOUCNOST):
-  14:00 → 4.50 CZK/kWh  (teď)
-  15:00 → 4.80 CZK/kWh
-  ...
-  23:00 → 5.20 CZK/kWh
-  Zítra 00:00 → 2.10 CZK/kWh  
-  Zítra 01:00 → 1.80 CZK/kWh  ← Nejlevnější v budoucnosti!
-  Zítra 02:00 → 2.30 CZK/kWh
-  ...
+Celý den (bez ohledu na zítřejší data):
+  hledá v 00:00-23:59 (celý dnešek) → najde 02:00-05:00
 
-Výsledek: 3h blok 00:00-03:00 (ZÍTŘEJŠÍ NOC) ✓
-→ Perfektní! Použitelné pro automatizaci!
+✓ Stabilní hodnota celý den
+✓ Nikdy nezahrnuje zítřejší data (respektuje nastavení)
 ```
 
-### Scénář 3: 22:00, NEMÁME zítřejší data ✅
+### ✅ Scénář 4: Zítřejší data dostupná, ale drahé
 
-**PO opravě:**
 ```
-Čas: 22:00
-Tomorrow data: NEDOSTUPNÁ ✗
+cross_midnight: True
+tomorrow_data: DOSTUPNÁ ✓
 
-Zbývající budoucí intervaly: pouze 22:00-23:59 (2 hodiny)
-→ Pro 3h blok nestačí!
+Ceny dnes: nízké ráno (02:00-05:00 = 1.5 CZK/kWh)
+Ceny zítra: vysoké celý den (nejlevnější 05:00-08:00 = 4.0 CZK/kWh)
 
-Řešení: Použij VŠECHNY dnešní intervaly (včetně minulých)
+V 14:00 (přijdou zítřejší data):
+  hledá v 14:00-23:59 (zbývající dnes) + 00:00-23:59 (celý zítřek)
+  → najde 21:00-00:00 (dnešní večer) ← Může najít DNEŠNÍ blok!
 
-Výsledek: 3h blok 02:00-05:00 (z rána) ✓
-→ OK, lepší data zatím nemáme
+✓ Algoritmus najde nejlevnější, ať už dnes nebo zítra
+✓ V tomto případě dnešní večer je levnější než celý zítřek
 ```
 
-## Řešení
-
-### Klíčová logika (řádky 204-271)
+## Finální implementace
 
 ```python
 for block in config.all_cheapest_blocks():
-    if self._tomorrow_day is not None:
-        # ===== MÁME zítřejší data =====
-        # Filtruj na BUDOUCÍ intervaly z dneška
-        intervals_for_cheapest = {
-            dt: interval 
-            for dt, interval in self._today_day.interval_by_dt.items()
-            if interval.dt_local >= self.now  # ← Jen budoucí!
-        }
-        
-        # Přidej zítřejší data podle nastavení
-        if config.cheapest_blocks_cross_midnight and block is not None:
+    if config.cheapest_blocks_cross_midnight and block is not None:
+        # Cross-midnight mode (multi-hour blocks)
+        if self._tomorrow_day is not None:
+            # MÁME zítřejší data
+            # → Filtruj na BUDOUCÍ dnešní + celý zítřek
+            intervals_for_cheapest = {
+                dt: interval 
+                for dt, interval in self._today_day.interval_by_dt.items()
+                if interval.dt_local >= self.now
+            }
             intervals_for_cheapest.update(self._tomorrow_day.interval_by_dt)
         else:
-            # Přidej zítřek jen když dneska nezbývá dost intervalů
-            if len(intervals_for_cheapest) < needed_intervals:
-                intervals_for_cheapest.update(self._tomorrow_day.interval_by_dt)
+            # NEMÁME zítřejší data
+            # → Celý dnešek (stabilní hodnota)
+            intervals_for_cheapest = self._today_day.interval_by_dt.copy()
     else:
-        # ===== NEMÁME zítřejší data =====
-        # Použij VŠECHNY dnešní intervaly (i minulé)
+        # cross_midnight=False nebo single interval
+        # → Vždy celý dnešek (stabilní hodnota)
         intervals_for_cheapest = self._today_day.interval_by_dt.copy()
     
-    # Najdi nejlevnější okno
     window = find_cheapest_window(intervals_for_cheapest, ...)
 ```
 
-### Proč tento přístup?
+## Logická tabulka
 
-**Když MÁME zítřejší data (po 13:10):**
-- ✅ Filtrujeme minulé intervaly → hledáme jen v budoucnosti
-- ✅ Zahrnutí zítřejších cen → najdeme skutečně nejlevnější budoucí blok
-- ✅ **Tohle byl hlavní problém** - teď se správně přepočítá po příchodu zítřejších dat!
+| cross_midnight | tomorrow_data | Hledá v intervalech | Stabilita |
+|----------------|---------------|---------------------|-----------|
+| False | ✗ NE | 00:00-23:59 (dnes) | ✓ Stabilní celý den |
+| False | ✓ ANO | 00:00-23:59 (dnes) | ✓ Stabilní celý den |
+| True | ✗ NE | 00:00-23:59 (dnes) | ✓ Stabilní celý den |
+| True | ✓ ANO | NOW-23:59 (dnes) + 00:00-23:59 (zítra) | ✓ Aktualizuje se jednou v 13:10 |
 
-**Když NEMÁME zítřejší data (před 13:10):**
-- ✅ Nefiltrujeme → používáme všechny dnešní intervaly
-- ✅ Pozdě večer (22:00) máme jen 2h budoucnosti → používáme celý den
-- ✅ Aspoň něco zobrazíme, i když to obsahuje minulé bloky
+## Co oprava řeší?
 
-### Proč používáme lokální čas?
-
-```python
-if interval.dt_local >= self.now  # ← lokální Prague čas
+### ✅ PŘED opravou (cross_midnight=True):
+```
+08:00 bez zítřka → 02:00-05:00 (minulost, ale OK - stabilní)
+14:00 se zítřkem → 02:00-05:00 (dnes ráno) ❌ NEAKTUALIZOVALO SE!
+                    Mělo najít 01:00-04:00 (zítra)
 ```
 
-- `self.now` = aktuální čas v Prague timezone (řádek 162)
-- `interval.dt_local` = čas intervalu v Prague timezone
-- Celá integrace pracuje s Prague timezone
-- Dictionary klíče jsou UTC, ale pro filtraci musíme použít lokální čas!
-
-## Důsledky opravy
-
-### ✅ Před 13:10 (zítřejší data NEDOSTUPNÁ)
-- Hledá ve **všech** dnešních intervalech (00:00-23:59)
-- Může najít i minulý blok (např. 02:00-05:00), ale to je OK - nemáme lepší data
-- Funguje i pozdě večer (22:00) ✓
-
-### ✅ Po 13:10 (zítřejší data DOSTUPNÁ, cross_midnight = True)
-- Hledá **JEN v budoucích** dnešních + všechny zítřejší (např. 14:00-23:59 + 00:00-23:59)
-- **HLAVNÍ OPRAVA**: Nyní najde skutečně nejlevnější budoucí blok!
-- Např. může najít 01:00-04:00 zítra místo 15:00-18:00 dnes ✓
-
-### ✅ Po 13:10 (zítřejší data DOSTUPNÁ, cross_midnight = False)
-- Hledá **JEN v budoucích** dnešních intervalech (14:00-23:59)
-- Pokud nezbývá dost intervalů, automaticky přidá zítřek
-- Respektuje uživatelské nastavení ✓
+### ✅ PO opravě (cross_midnight=True):
+```
+08:00 bez zítřka → 02:00-05:00 (stabilní)
+14:00 se zítřkem → 01:00-04:00 (zítra) ✓ AKTUALIZOVALO SE!
+```
 
 ## Testování
 
-Pro otestování použij Home Assistant Template:
-
+### Test 1: Stabilita během dne (před 13:10)
 ```yaml
-# Otestuj v Developer Tools → Template
-{{ state_attr('sensor.electricity_spot_cheapest_1_hour', 'start') }}
-{{ state_attr('sensor.electricity_spot_cheapest_3_hours', 'start') }}
+# Otestuj ve stejný den v různých časech:
+# 08:00
+{{ state_attr('sensor.cheapest_3_hours', 'start') }}
+# → např. 02:00
 
-# Kontrola:
-# Před 13:10: může ukazovat minulý čas (např. 02:00) - OK
-# Po 13:10: musí ukazovat budoucí čas (např. 15:00 dnes nebo 01:00 zítra) - OPRAVENO!
+# 12:00 (stále stejný výsledek?)
+{{ state_attr('sensor.cheapest_3_hours', 'start') }}
+# → musí být 02:00 ✓ (STEJNÉ!)
+```
+
+### Test 2: Update po příchodu zítřejších dat
+```yaml
+# Před 13:10:
+{{ state_attr('sensor.cheapest_3_hours', 'start') }}
+# → např. 02:00 (dnes ráno)
+
+# Po 13:10 (když přijdou zítřejší data):
+{{ state_attr('sensor.cheapest_3_hours', 'start') }}
+# → např. 01:00 a date je zítra ✓ (ZMĚNILO SE!)
+```
+
+### Test 3: Kontrola v automatizaci
+```yaml
+automation:
+  - alias: "Charge battery in cheapest block"
+    trigger:
+      - platform: time
+        at: "{{ state_attr('sensor.cheapest_3_hours', 'start') }}"
+    condition:
+      # Check if block is in the future
+      - condition: template
+        value_template: >
+          {{ (state_attr('sensor.cheapest_3_hours', 'start') | as_datetime) > now() }}
+    action:
+      - service: switch.turn_on
+        target:
+          entity_id: switch.battery_charging
 ```
 
 ## Závěr
 
-**Klíčová změna**: Filtrování minulých intervalů se provádí **JEN když máme zítřejší data**.
+**Klíčový princip**: Cheapest blocks jsou **stabilní během dne** a aktualizují se **JEDNOU** když přijdou zítřejší data (v ~13:10).
 
-Díky tomu:
-- ✅ Po 13:10 se cheapest blocks správně přepočítají s novými zítřejšími cenami
-- ✅ Nikdy neukazují minulé bloky když máme zítřejší data
-- ✅ Před 13:10 stále fungují (používají všechny dnešní intervaly)
-- ✅ Pozdě večer (22:00) bez zítřejších dat stále najdou bloky
+**Proč to funguje?**
+- ✅ Před 13:10: Hledá v celém dnešku (00:00-23:59) → stabilní hodnota
+- ✅ Po 13:10: Hledá v budoucích dnešních + zítřek → jedna aktualizace
+- ✅ Uživatel kontroluje v automatizaci, jestli je blok v budoucnosti
+- ✅ Hodnota se nemění každou hodinu
 
-**Soubor**: `coordinator.py` (řádky 204-271)  
-**Status**: ✅ OPRAVENO - kondicionální filtrování podle dostupnosti zítřejších dat
+**Co opravuje?**
+- ❌ Původně: `self._today_tomorrow_by_dt` obsahovalo i minulé intervaly
+- ✅ Opraveno: Když máme zítřejší data, filtrujeme na `interval.dt_local >= self.now`
+
+**Soubor**: `coordinator.py` (řádky 204-255)  
+**Status**: ✅ OPRAVENO - aktualizace při příchodu zítřejších dat

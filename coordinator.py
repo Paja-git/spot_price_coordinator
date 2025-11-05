@@ -205,57 +205,43 @@ class IntervalSpotRateData:
             return
 
         for block in config.all_cheapest_blocks():
-            # Decide whether to filter past intervals based on tomorrow data availability
-            if self._tomorrow_day is not None:
-                # Tomorrow data IS available → filter out past intervals, use only future
-                intervals_for_cheapest = {
-                    dt: interval 
-                    for dt, interval in self._today_day.interval_by_dt.items()
-                    if interval.dt_local >= self.now  # Only future intervals from today
-                }
-                
-                # Add tomorrow's data based on cross_midnight setting
-                if config.cheapest_blocks_cross_midnight and block is not None:
-                    # Cross-midnight enabled: ALWAYS add tomorrow's data
+            if config.cheapest_blocks_cross_midnight and block is not None:
+                # Cross-midnight mode enabled for multi-hour blocks
+                if self._tomorrow_day is not None:
+                    # Tomorrow data IS available → filter to FUTURE today + ALL tomorrow
+                    # This updates the cheapest block when tomorrow prices arrive
+                    intervals_for_cheapest = {
+                        dt: interval 
+                        for dt, interval in self._today_day.interval_by_dt.items()
+                        if interval.dt_local >= self.now  # Only future from today
+                    }
                     intervals_for_cheapest.update(self._tomorrow_day.interval_by_dt)
                     logger.debug(
-                        "Cheapest %s-hour block: cross_midnight enabled, searching %d future intervals from today + %d from tomorrow",
+                        "Cheapest %s-hour block: cross_midnight with tomorrow data, searching %d future intervals from today + %d from tomorrow",
                         block,
-                        sum(1 for dt, interval in self._today_day.interval_by_dt.items() if interval.dt_local >= self.now),
+                        len([dt for dt, interval in self._today_day.interval_by_dt.items() if interval.dt_local >= self.now]),
                         len(self._tomorrow_day.interval_by_dt)
                     )
                 else:
-                    # Cross-midnight disabled: only add tomorrow if we don't have enough intervals today
-                    available_today = len(intervals_for_cheapest)
-                    
-                    # Calculate how many intervals we need for this block
-                    if block is None:
-                        needed_intervals = 1
-                    elif config.interval == SpotRateIntervalType.Hour:
-                        needed_intervals = block
-                    else:
-                        needed_intervals = block * 4  # 15-min intervals
-                    
-                    if available_today < needed_intervals:
-                        # Not enough intervals left today, must include tomorrow
-                        intervals_for_cheapest.update(self._tomorrow_day.interval_by_dt)
-                        logger.debug(
-                            "Cheapest %s-hour block: only %d intervals left today (need %d), including tomorrow's data",
-                            "single" if block is None else str(block),
-                            available_today,
-                            needed_intervals
-                        )
+                    # Tomorrow data NOT available → use ALL of today
+                    # This keeps the cheapest block stable throughout the day
+                    intervals_for_cheapest = self._today_day.interval_by_dt.copy()
+                    logger.debug(
+                        "Cheapest %s-hour block: cross_midnight without tomorrow data, using all %d intervals from today",
+                        block,
+                        len(intervals_for_cheapest)
+                    )
             else:
-                # Tomorrow data is NOT available yet → use ALL of today's intervals (including past)
-                # This ensures we can still show cheapest blocks even late in the day
+                # Cross-midnight disabled OR single interval (block is None)
+                # Always use ALL of today's data for consistency
                 intervals_for_cheapest = self._today_day.interval_by_dt.copy()
                 logger.debug(
-                    "Cheapest %s-hour block: tomorrow data not available, using all %d intervals from today",
-                    "single" if block is None else str(block),
+                    "Cheapest %s block: no cross_midnight, using all %d intervals from today",
+                    "interval" if block is None else f"{block}-hour",
                     len(intervals_for_cheapest)
                 )
             
-            # Validate we have enough intervals
+            # Validate we have intervals
             if not intervals_for_cheapest:
                 logger.warning(
                     "No intervals available for cheapest %s block calculation",
