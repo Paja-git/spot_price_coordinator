@@ -1,7 +1,7 @@
 # FIX: Cheapest Blocks Not Updating When Tomorrow Data Available
 
 ## Problém
-Když se stala dostupná data pro zítřek (po 13:10 CET), senzory pro "cheapest blocks" **neaktualizovaly** svoje hodnoty správně při použití `cheapest_blocks_cross_midnight`.
+Když se stala dostupná data pro zítřek (po 13:10 CET), senzory pro "cheapest blocks" **neaktualizovaly** svoje hodnoty správně při použití `cheapest_blocks_cross_midnight` a ani bez nej.
 
 ## Příčina
 Původní kód v `IntervalSpotRateData.__init__()` (řádky 207-211):
